@@ -8,21 +8,19 @@ import requests
 import warnings
 warnings.filterwarnings('ignore')
 
-# CONFIGURACIÓN DE CREDENCIALES
+# CONFIGURACIÓN SEGURA PARA GITHUB ACTIONS
 FRED_API_KEY = os.environ.get('FRED_API_KEY', '37016f0e7a9489663c246fe275a8f8b4')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8045615537:AAHljJ57Y_-kn-j7A3SLHfbaRqj61y3Tntg')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '1816896290')
 
 DB_NAME = '/tmp/market_intelligence.db' # /tmp es writable en GitHub Actions
-
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
-WEIGHTS = np.array([1.0, 3.0, 3.0, 1.0, 1.0]) 
+BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
-THRESHOLD = 6.5 
 
 class InstitutionalEngine:
     def __init__(self):
-        self.weights_rep = np.tile(WEIGHTS, LOOKBACK)
+        pass
 
     def ingest(self):
         print("📡 Sincronizando fuentes...")
@@ -41,11 +39,11 @@ class InstitutionalEngine:
                     frames.append(s)
             if frames:
                 f_df = pd.concat(frames, axis=1)
-                print(f"✅ FRED: {len(f_df)} registros.")
+                print(f"✅ FRED: {len(f_df)} registros cargados.")
         except Exception as e:
             print(f"⚠️ FRED Error: {str(e)[:60]}")
 
-        # 2. Yahoo Data (con manejo de bloqueo de DB)
+        # 2. Yahoo Data
         close = pd.DataFrame()
         try:
             yf_data = yf.download(['XLF', 'KBE', 'SPY'], start="2000-01-01", progress=False)
@@ -56,7 +54,7 @@ class InstitutionalEngine:
                 close = yf_data['Close'] if 'Close' in yf_data.columns else yf_data
             
             close.columns = [c.lower() for c in close.columns]
-            print(f"✅ Yahoo: {len(close)} registros.")
+            print(f"✅ Yahoo: {len(close)} registros cargados.")
         except Exception as e:
             print(f"⚠️ Yahoo Error: {str(e)[:60]}")
 
@@ -71,23 +69,29 @@ class InstitutionalEngine:
         if 'dgs10' in df.columns and 'dgs2' in df.columns:
             df['curve_slope'] = df['dgs10'] - df['dgs2']
             
-        # CORRECCIÓN 1: Sintaxis compatible con Pandas >= 2.0
+        # Sintaxis compatible con Pandas >= 2.0
         df = df.ffill() 
         df.sort_index(inplace=True)
         df.index.name = 'date'
         
-        # Guardar en DB (usando WAL mode para evitar locks)
+        # Guardar en DB con WAL mode para evitar locks en CI/CD
         conn = sqlite3.connect(DB_NAME)
         conn.execute("PRAGMA journal_mode=WAL;")
         df.to_sql('market_synced_data', conn, if_exists='replace', index=True)
         conn.close()
-        print(f"💾 BD guardada: {len(df)} filas.")
+        print(f" BD guardada: {len(df)} filas.")
         return df
 
     def analyze_live(self, df):
-        available_features = [f for f in FEATURES if f in df.columns]
-        if len(available_features) < 2:
-            raise ValueError("Insuficientes datos para analizar.")
+        """Análisis adaptativo con normalización por dimensionalidad."""
+        
+        # Filtrado estricto: Solo columnas existentes Y con varianza real (>0)
+        available_features = [f for f in FEATURES 
+                             if f in df.columns and df[f].std() > 0]
+        
+        n_features = len(available_features)
+        if n_features == 0:
+            raise ValueError("Sin datos con varianza para analizar.")
             
         changes = df[available_features].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         mean_h = changes.mean(); std_h = changes.std(); std_h[std_h==0]=1
@@ -112,15 +116,25 @@ class InstitutionalEngine:
         knn.fit(h_scaled)
         dist, idx = knn.kneighbors(c_scaled)
         
-        twins = [{'date': h_dates[idx[0][k]], 'dist': dist[0][k]} for k in range(5)]
-        return twins, dist[0][0]
+        # CORRECCIÓN MATEMÁTICA: Normalizar distancia por sqrt(n)
+        raw_dist = dist[0][0]
+        normalized_dist = raw_dist / np.sqrt(n_features) 
+        
+        # Umbral dinámico: escala proporcionalmente para mantener significancia
+        dynamic_threshold = BASE_THRESHOLD / np.sqrt(len(FEATURES)) * np.sqrt(n_features)
+        
+        twins = [{'date': h_dates[idx[0][k]], 'dist': normalized_dist} for k in range(5)]
+        return twins, normalized_dist, dynamic_threshold, n_features
 
-    def send_alert(self, dist, has_macro):
-        if has_macro:
-            status = "🟢 NORMAL" if dist > THRESHOLD else "🔴 ALERTA SISTÉMICA"
-            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n Dist: {dist:.2f}\n{status}\n📊 Macro: ✅"
+    def send_alert(self, dist, threshold, n_feat):
+        has_full_data = (n_feat == len(FEATURES))
+        
+        if has_full_data:
+            status = "🟢 NORMAL" if dist > threshold else "🔴 ALERTA SISTÉMICA"
+            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
         else:
-            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n⚠️ Solo precios\n📊 FRED: ⏳\n Alertas limitadas"
+            status = "🔍 OBSERVACIÓN" if dist > threshold else "⚠️ SEGUIMIENTO"
+            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
             
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
@@ -130,7 +144,6 @@ class InstitutionalEngine:
             print(f"⚠️ Telegram Error: {str(e)[:50]}")
 
     def run(self):
-        # CORRECCIÓN 2: Manejo robusto de DB vacía/corrupta
         conn = sqlite3.connect(DB_NAME)
         conn.execute("PRAGMA journal_mode=WAL;")
         try: 
@@ -141,10 +154,9 @@ class InstitutionalEngine:
             df = self.ingest()
         conn.close()
         
-        has_macro = all(f in df.columns for f in ['vix', 'hy_spread', 'sofr'])
-        twins, dist = self.analyze_live(df)
-        self.send_alert(dist, has_macro)
-        print(f"🏁 Janus Engine completado. Distancia: {dist:.2f}")
+        twins, dist, dyn_thresh, n_feat = self.analyze_live(df)
+        self.send_alert(dist, dyn_thresh, n_feat)
+        print(f"🏁 Janus Engine completado. Distancia normalizada: {dist:.2f} | Variables activas: {n_feat}")
 
 if __name__ == "__main__":
     engine = InstitutionalEngine()
