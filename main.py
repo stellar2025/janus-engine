@@ -1,7 +1,3 @@
-# ==============================================================================
-# JANUS ENGINE — INSTITUTIONAL GRADE (CORREGIDO)
-# ==============================================================================
-
 import pandas as pd
 import numpy as np
 import yfinance as yf
