@@ -1,3 +1,11 @@
+# INSTALACIÓN DE DEPENDENCIAS (Ejecutar solo una vez por sesión)
+!pip install fredapi yfinance pandas numpy scikit-learn plotly requests tqdm -q
+
+# Verificación rápida
+import fredapi
+print("✅ fredapi instalado correctamente.")
+
+
 # ==============================================================================
 # JANUS ENGINE — INSTITUTIONAL GRADE (CORREGIDO)
 # ==============================================================================
