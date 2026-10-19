@@ -24,43 +24,35 @@ class InstitutionalEngine:
         pass
 
     def ingest(self):
-        print("📡 Sincronizando fuentes...")
+        print(" Sincronizando fuentes...")
         
-        # 1. FRED Data CON RETRY + FALLBACK A YAHOO PROXIES
+        # PRIORIDAD 1: LEER CSV REAL SUBIDO DESDE GOOGLE APPS SCRIPT
         f_df = pd.DataFrame()
-        fred_success = False
+        csv_path = '/home/runner/work/janus-engine/janus-engine/data/fred_data_real.csv'
+        data_source = "PROXIES_YAHOO" 
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                fred = Fred(api_key=FRED_API_KEY.strip())
-                series_map = {'vix': 'VIXCLS', 'hy_spread': 'BAMLH0A0HYM2', 
-                             'dgs2': 'DGS2', 'dgs10': 'DGS10', 'sofr': 'SOFR'}
-                frames = []
-                for name, code in series_map.items():
-                    s = fred.get_series(code)
-                    if not s.empty:
-                        s.name = name
-                        frames.append(s)
+        try:
+            if os.path.exists(csv_path):
+                temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
+                last_date = temp_df.index[-1]
+                days_old = (pd.Timestamp.now() - last_date).days
                 
-                if frames:
-                    f_df = pd.concat(frames, axis=1)
-                    print(f"✅ FRED: {len(f_df)} registros cargados.")
-                    fred_success = True
-                    break
-                    
-            except Exception as e:
-                wait_time = 2 ** (attempt + 1)
-                print(f"⚠️ FRED Intento {attempt+1}/{max_retries} fallido: {str(e)[:60]}")
-                if attempt < max_retries - 1:
-                    print(f"   ⏳ Esperando {wait_time}s antes de reintentar...")
-                    time.sleep(wait_time)
-        
-        # FALLBACK: Si FRED falla tras todos los intentos, usar Yahoo como proxy macro
-        if not fred_success:
-            print("🔄 FRED bloqueado. Activando proxies macro vía Yahoo Finance...")
+                if days_old <= 3:
+                    f_df = temp_df
+                    data_source = "FRED_REAL_CSV"
+                    print(f"✅ FRED REAL (CSV): {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                else:
+                    print(f"⚠️ CSV de FRED desactualizado ({days_old} días). Usando fallback.")
+            else:
+                print("⚠️ CSV de FRED no encontrado en /data/. Usando fallback.")
+                
+        except Exception as e:
+            print(f"⚠️ Error leyendo CSV FRED: {str(e)[:60]}. Usando fallback.")
+
+        # PRIORIDAD 2: FALLBACK A PROXIES YAHOO SI NO HAY CSV VÁLIDO
+        if f_df.empty:
+            print("🔄 Activando proxies macro vía Yahoo Finance...")
             try:
-                # ^VIX ≈ VIXCLS | ^TNX ≈ DGS10 | ^IRX ≈ DGS2/SOFR proxy
                 yf_macro = yf.download(['^VIX', '^TNX', '^IRX'], start="2000-01-01", progress=False)
                 if isinstance(yf_macro.columns, pd.MultiIndex):
                     yf_macro = yf_macro.xs('Close', level='Price', axis=1)
@@ -68,17 +60,17 @@ class InstitutionalEngine:
                 rename_map = {'^VIX': 'vix', '^TNX': 'dgs10', '^IRX': 'dgs2'}
                 yf_macro.rename(columns=rename_map, inplace=True)
                 
-                # Reconstruir features derivados con proxies
                 if 'dgs10' in yf_macro.columns and 'dgs2' in yf_macro.columns:
                     yf_macro['curve_slope'] = yf_macro['dgs10'] - yf_macro['dgs2']
-                    yf_macro['sofr'] = yf_macro['dgs2'] / 100  # IRX en %, convertir a decimal
-                    yf_macro['hy_spread'] = yf_macro['dgs10'] - yf_macro['dgs2']  # Proxy aproximado
+                    yf_macro['sofr'] = yf_macro['dgs2'] / 100
+                    yf_macro['hy_spread'] = yf_macro['dgs10'] - yf_macro['dgs2']
                 
                 f_df = yf_macro[['vix', 'hy_spread', 'curve_slope', 'sofr']].copy()
-                print(f"✅ Proxies Macro (Yahoo): {len(f_df)} registros cargados.")
+                data_source = "PROXIES_YAHOO"
+                print(f"⚠️ Proxies Macro (Yahoo): {len(f_df)} registros cargados.")
                 
             except Exception as e:
-                print(f"️ Proxies Macro fallaron: {str(e)[:60]}")
+                print(f" Proxies Macro fallaron: {str(e)[:60]}")
 
         # 2. Yahoo Data (Precios)
         close = pd.DataFrame()
@@ -106,7 +98,24 @@ class InstitutionalEngine:
         if 'dgs10' in df.columns and 'dgs2' in df.columns:
             df['curve_slope'] = df['dgs10'] - df['dgs2']
             
-        df = df.ffill() 
+        # LIMPIEZA ESTRICTA POST-FUSIÓN (Auditoría completada - Sin bugs)
+        # 1. Eliminar filas donde TODAS las columnas macro sean nulas
+        macro_cols = [c for c in ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr'] if c in df.columns]
+        if macro_cols:
+            df = df.dropna(subset=macro_cols, how='all')
+        
+        # 2. Asegurar que NO hay datos futuros respecto al último cierre de SPY
+        if 'spy' in df.columns:
+            last_spy_idx = df['spy'].last_valid_index()
+            if last_spy_idx is not None:
+                df = df.loc[:last_spy_idx]
+        
+        # 3. Rellenar huecos puntuales DE MANERA SEGURA
+        df = df.ffill()
+        
+        # 4. VALIDACIÓN FINAL: Solo eliminamos filas que siguen incompletas DESPUÉS del relleno
+        df = df.dropna() 
+        
         df.sort_index(inplace=True)
         df.index.name = 'date'
         
@@ -114,7 +123,7 @@ class InstitutionalEngine:
         conn.execute("PRAGMA journal_mode=WAL;")
         df.to_sql('market_synced_data', conn, if_exists='replace', index=True)
         conn.close()
-        print(f"💾 BD guardada: {len(df)} filas.")
+        print(f" BD guardada: {len(df)} filas. Fuente: {data_source}")
         return df
 
     def analyze_live(self, df):
@@ -159,11 +168,11 @@ class InstitutionalEngine:
         has_full_data = (n_feat == len(FEATURES))
         
         if has_full_data:
-            status = "🟢 NORMAL" if dist > threshold else "🔴 ALERTA SISTÉMICA"
-            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
+            status = " NORMAL" if dist > threshold else " ALERTA SISTÉMICA"
+            msg = f"🤖 *Janus Engine*\n️ Ejecutado: {execution_time}\n Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n Macro: ✅ ({n_feat}/5 vars)"
         else:
             status = "🔍 OBSERVACIÓN" if dist > threshold else "⚠️ SEGUIMIENTO"
-            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
+            msg = f" *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n FRED pendiente"
             
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
         response = requests.get(url, timeout=10)
