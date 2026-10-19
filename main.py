@@ -1,4 +1,5 @@
 import os
+import time  # NECESARIO PARA LA LÓGICA DE REINTENTOS
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -25,23 +26,36 @@ class InstitutionalEngine:
     def ingest(self):
         print("📡 Sincronizando fuentes...")
         
-        # 1. FRED Data
+        # 1. FRED Data CON RETRY LOGIC PARA EVITAR BLOQUEOS DE IP
         f_df = pd.DataFrame()
-        try:
-            fred = Fred(api_key=FRED_API_KEY.strip())
-            series_map = {'vix': 'VIXCLS', 'hy_spread': 'BAMLH0A0HYM2', 
-                         'dgs2': 'DGS2', 'dgs10': 'DGS10', 'sofr': 'SOFR'}
-            frames = []
-            for name, code in series_map.items():
-                s = fred.get_series(code)
-                if not s.empty:
-                    s.name = name
-                    frames.append(s)
-            if frames:
-                f_df = pd.concat(frames, axis=1)
-                print(f"✅ FRED: {len(f_df)} registros cargados.")
-        except Exception as e:
-            print(f"️ FRED Error: {str(e)[:60]}")
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                fred = Fred(api_key=FRED_API_KEY.strip())
+                series_map = {'vix': 'VIXCLS', 'hy_spread': 'BAMLH0A0HYM2', 
+                             'dgs2': 'DGS2', 'dgs10': 'DGS10', 'sofr': 'SOFR'}
+                frames = []
+                for name, code in series_map.items():
+                    s = fred.get_series(code)
+                    if not s.empty:
+                        s.name = name
+                        frames.append(s)
+                
+                if frames:
+                    f_df = pd.concat(frames, axis=1)
+                    print(f"✅ FRED: {len(f_df)} registros cargados.")
+                    break  # Éxito, salir del bucle de reintentos
+                    
+            except Exception as e:
+                wait_time = 2 ** (attempt + 1)  # Espera exponencial: 2s, 4s, 8s
+                print(f"️ FRED Intento {attempt+1}/{max_retries} fallido: {str(e)[:60]}")
+                if attempt < max_retries - 1:
+                    print(f"   ⏳ Esperando {wait_time}s antes de reintentar...")
+                    time.sleep(wait_time)
+        else:
+            # Este bloque solo se ejecuta si el bucle NO se rompió (todos los intentos fallaron)
+            print("❌ FRED agotó todos los intentos. Continuando solo con Yahoo.")
 
         # 2. Yahoo Data
         close = pd.DataFrame()
@@ -133,8 +147,8 @@ class InstitutionalEngine:
             status = "🟢 NORMAL" if dist > threshold else "🔴 ALERTA SISTÉMICA"
             msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
         else:
-            status = "🔍 OBSERVACIÓN" if dist > threshold else "⚠️ SEGUIMIENTO"
-            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
+            status = " OBSERVACIÓN" if dist > threshold else "️ SEGUIMIENTO"
+            msg = f"🤖 *Janus Engine*\n️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
             
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
         response = requests.get(url, timeout=10)
@@ -157,7 +171,7 @@ class InstitutionalEngine:
         data_date = df.index[-1].strftime('%Y-%m-%d')
         
         self.send_alert(dist, dyn_thresh, n_feat, exec_time, data_date)
-        print(f" Janus Engine completado. Distancia normalizada: {dist:.2f} | Variables activas: {n_feat}")
+        print(f"🏁 Janus Engine completado. Distancia normalizada: {dist:.2f} | Variables activas: {n_feat}")
 
 if __name__ == "__main__":
     engine = InstitutionalEngine()
