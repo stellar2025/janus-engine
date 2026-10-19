@@ -26,7 +26,7 @@ class InstitutionalEngine:
     def ingest(self):
         print("📡 Sincronizando fuentes...")
         
-        # 1. LEER CSV REAL DE FRED
+        # 1. LEER CSV REAL DE FRED (SUBIDO POR GOOGLE APPS SCRIPT)
         f_df = pd.DataFrame()
         csv_path = '/home/runner/work/janus-engine/janus-engine/data/fred_data_real.csv'
         data_source = "PROXIES_YAHOO" 
@@ -35,30 +35,28 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # --- LIMPIEZA QUIRÚRGICA IMITANDO FRED API ---
-                # La API de FRED en Colab no devuelve filas donde TODAS las macros son NaN simultáneamente
-                # salvo festivos extremos. Nuestro CSV tiene basura parcial.
-                # Estrategia: Eliminar filas donde falte CUALQUIERA de las 5 macros clave.
-                # Esto garantiza que cada fila tenga datos completos, igual que en Colab.
+                # --- LIMPIEZA QUIRÚRGICA IMITANDO EL COMPORTAMIENTO NATIVO DE LA API FRED EN COLAB ---
+                # En Colab, la API devuelve series limpias. Nuestro CSV tiene huecos visibles ('').
+                # Estrategia: Eliminar CUALQUIER fila donde falte AL MENOS UNA variable macro clave.
+                # Esto previene que pct_change() genere saltos artificiales por transiciones NaN->Valor.
                 required_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
                 available_cols = [c for c in required_cols if c in temp_df.columns]
                 
                 if len(available_cols) == 5:
-                    # Dropna how='any': Borra cualquier fila incompleta.
-                    # En Colab, FRED suele devolver series alineadas. Aquí forzamos esa alineación.
+                    # Dropna how='any': Solo conservamos días con 5/5 datos macro válidos
                     clean_temp_df = temp_df.dropna(subset=available_cols, how='any')
                     
                     last_date = clean_temp_df.index[-1]
                     days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
                     
-                    if days_old <= 7: # Tolerancia para fines de semana/festivos
+                    if days_old <= 7: # Tolerancia para fines de semana/festivos largos
                         f_df = clean_temp_df
-                        data_source = "FRED_REAL_CSV_STRICT"
-                        print(f"✅ FRED REAL (STRICT): {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                        data_source = "FRED_REAL_CSV_CLEANED"
+                        print(f"✅ FRED REAL LIMPIO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                     else:
                         print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
                 else:
-                     print(f"⚠️ Columnas incompletas. Usando fallback.")
+                     print(f"⚠️ Columnas incompletas en CSV. Usando fallback.")
             else:
                 print("⚠️ CSV no encontrado. Usando fallback.")
                 
@@ -111,9 +109,9 @@ class InstitutionalEngine:
         if f_df.empty or close.empty:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
-        # 4. MERGE INTERNO SEGURO
-        # Igual que en Colab: concat + ffill. 
-        # Pero aquí ya hemos filtrado los NaNs graves en f_df.
+        # 4. MERGE SEGURO (IDÉNTICO A COLAB)
+        # Usamos concat en eje 1. Como ya hemos filtrado los NaNs graves en f_df,
+        # esto alineará correctamente las fechas comunes.
         df = pd.concat([f_df, close], axis=1)
         
         # 5. FEATURE ENGINEERING (IDÉNTICO A COLAB)
@@ -122,9 +120,8 @@ class InstitutionalEngine:
         if 'dgs10' in df.columns and 'dgs2' in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. LIMPIEZA FINAL IDÉNTICA A COLAB
-        # En Colab haces: df = df.ffill(). Sort_index. Nada más.
-        # Replicamos eso exactamente.
+        # 6. LIMPIEZA FINAL (IDÉNTICO A COLAB)
+        # Rellenamos cualquier hueco residual menor con forward-fill
         df = df.ffill() 
         df.sort_index(inplace=True)
         df.index.name = 'date'
@@ -137,7 +134,6 @@ class InstitutionalEngine:
         return df
 
     def analyze_live(self, df):
-        # --- LÓGICA IDÉNTICA A COLAB SIN MODIFICACIONES ---
         available_features = [f for f in FEATURES 
                              if f in df.columns and df[f].std() > 0]
         
@@ -147,7 +143,7 @@ class InstitutionalEngine:
             
         changes = df[available_features].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # Media y Desviación sobre TODA la historia (como en Colab)
+        # NORMALIZACIÓN GLOBAL (IDÉNTICO A COLAB)
         mean_h = changes.mean()
         std_h = changes.std()
         std_h[std_h==0]=1
