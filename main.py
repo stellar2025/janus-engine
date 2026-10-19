@@ -18,6 +18,7 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
+REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
 
 class InstitutionalEngine:
     def __init__(self):
@@ -35,31 +36,30 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # CRÍTICO: Filtrar inmediatamente las filas con huecos en las 5 macros principales
-                # Definimos qué columnas consideramos "macro essentials" desde el CSV
+                # Limpiar inmediatamente filas con huecos críticos en macros
                 required_fred_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
                 available_fred_cols = [c for c in required_fred_cols if c in temp_df.columns]
                 
                 if len(available_fred_cols) == 5:
-                    # Dropna how='any': Elimina cualquier fila donde AL MENOS UNA de las 5 esté vacía
+                    # Dropna how='any': Solo conservar días donde TODAS las macros tienen valor
                     clean_temp_df = temp_df.dropna(subset=available_fred_cols, how='any')
                     
                     last_date = clean_temp_df.index[-1]
                     days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
                     
-                    if days_old <= 5: # Permitir hasta 5 días de lag por festivos/retrasos FRED
+                    if days_old <= 5:
                         f_df = clean_temp_df
                         data_source = "FRED_REAL_CSV_CLEANED"
                         print(f"✅ FRED REAL LIMPIO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                     else:
-                        print(f"⚠️ CSV limpio desactualizado ({days_old} días). Usando fallback.")
+                        print(f"⚠️ CSV desactualizado ({days_old} días). Usando fallback.")
                 else:
-                     print(f"⚠️ CSV no tiene todas las 5 columnas requeridas ({available_fred_cols}). Usando fallback.")
+                     print(f"⚠️ CSV no tiene todas las columnas requeridas. Usando fallback.")
             else:
-                print("⚠️ CSV de FRED no encontrado en /data/. Usando fallback.")
+                print("⚠️ CSV no encontrado. Usando fallback.")
                 
         except Exception as e:
-            print(f"❌ Error leyendo/limpiando CSV FRED: {str(e)[:60]}. Usando fallback.")
+            print(f"❌ Error leyendo CSV: {str(e)[:60]}. Usando fallback.")
 
         # 2. FALLBACK A PROXIES YAHOO SI NO HAY CSV VÁLIDO
         if f_df.empty:
@@ -72,13 +72,11 @@ class InstitutionalEngine:
                 rename_map = {'^VIX': 'vix', '^TNX': 'dgs10', '^IRX': 'dgs2'}
                 yf_macro.rename(columns=rename_map, inplace=True)
                 
-                # Calcular derivados en el proxy
                 if 'dgs10' in yf_macro.columns and 'dgs2' in yf_macro.columns:
                     yf_macro['curve_slope'] = yf_macro['dgs10'] - yf_macro['dgs2']
-                    yf_macro['sofr'] = yf_macro['dgs2'] / 100 # Proxy aproximado
-                    yf_macro['hy_spread'] = yf_macro['dgs10'] - yf_macro['dgs2'] # Proxy aproximado
+                    yf_macro['sofr'] = yf_macro['dgs2'] / 100
+                    yf_macro['hy_spread'] = yf_macro['dgs10'] - yf_macro['dgs2']
                 
-                # Seleccionar solo las columnas necesarias
                 cols_needed = ['vix', 'hy_spread', 'curve_slope', 'sofr']
                 available_proxy_cols = [c for c in cols_needed if c in yf_macro.columns]
                 
@@ -101,7 +99,7 @@ class InstitutionalEngine:
                 close = yf_data['Close'] if 'Close' in yf_data.columns else yf_data
             
             close.columns = [c.lower() for c in close.columns]
-            close.index = close.index.normalize() # Normalizar fecha
+            close.index = close.index.normalize()
             print(f"✅ Yahoo Precios: {len(close)} registros cargados.")
         except Exception as e:
             print(f"⚠️ Yahoo Error: {str(e)[:60]}")
@@ -109,28 +107,21 @@ class InstitutionalEngine:
         if f_df.empty or close.empty:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
-        # 4. MERGE INTERNO SEGURO (Inner Join)
-        # Esto garantiza que solo queden fechas donde AMBOS datasets tienen datos válidos
+        # 4. MERGE INTERNO SEGURO
         df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
         
-        # 5. FEATURE ENGINEERING SOBRE DATOS LIMPIOS
+        # 5. FEATURE ENGINEERING
         if 'xlf' in df.columns and 'spy' in df.columns:
             df['ratio_xlf_spy'] = df['xlf'] / df['spy']
-        
-        # Nota: curve_slope ya viene calculado en f_df si usamos FRED real o proxy
-        # Pero verificamos por seguridad
         if 'dgs10' in df.columns and 'dgs2' in df.columns and 'curve_slope' not in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. LIMPIEZA FINAL ESTRITA
-        # Aseguramos que las FEATURES definidas estén presentes y sean numéricas válidas
+        # 6. VALIDACIÓN FINAL
         final_features_check = [f for f in FEATURES if f in df.columns]
         if not final_features_check:
             raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
             
-        # Dropna final por si acaso algún cálculo dio NaN
         df = df.dropna(subset=final_features_check)
-        
         df.sort_index(inplace=True)
         df.index.name = 'date'
         
@@ -149,17 +140,40 @@ class InstitutionalEngine:
         if n_features == 0:
             raise ValueError("Sin datos con varianza para analizar.")
             
-        changes = df[available_features].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
-        mean_h = changes.mean(); std_h = changes.std(); std_h[std_h==0]=1
+        # CRÍTICO: Eliminar filas incompletas ANTES de calcular cambios porcentuales
+        # Esto previene artefactos en pct_change() causados por huecos o transiciones
+        df_clean = df[available_features].dropna()
         
+        if len(df_clean) < LOOKBACK * 2:
+            raise ValueError("Datos insuficientes tras limpieza para análisis robusto.")
+
+        # Calcular cambios porcentuales sobre datos limpios
+        changes = df_clean.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        # NORMALIZACIÓN POR VENTANA RODANTE (FIX PARA DISCREPANCIA COLAB/GITHUB)
+        # Usamos solo los últimos REFERENCE_WINDOW días como base estadística
+        # Esto elimina el sesgo de décadas antiguas (ej: alta volatilidad de los 80s vs baja de los 90s)
+        hist_slice = changes.iloc[:-LOOKBACK] # Excluir la ventana actual del cálculo histórico
+        
+        if len(hist_slice) > REFERENCE_WINDOW:
+            ref_changes = hist_slice.tail(REFERENCE_WINDOW)
+        else:
+            ref_changes = hist_slice
+            
+        mean_h = ref_changes.mean()
+        std_h = ref_changes.std()
+        std_h[std_h==0] = 1 # Evitar división por cero
+        
+        # Vector actual basado en la misma referencia estadística
         curr_win = changes.iloc[-LOOKBACK:]
         curr_vec = ((curr_win - mean_h) / std_h).values.flatten()
         
         h_states, h_dates = [], []
-        for i in range(len(changes) - LOOKBACK):
-            w = changes.iloc[i:i+LOOKBACK]
+        # Iterar sobre la misma referencia histórica usada para mean/std
+        for i in range(len(ref_changes) - LOOKBACK):
+            w = ref_changes.iloc[i:i+LOOKBACK]
             h_states.append(((w - mean_h) / std_h).values.flatten())
-            h_dates.append(changes.index[i+LOOKBACK-1])
+            h_dates.append(ref_changes.index[i+LOOKBACK-1])
             
         from sklearn.preprocessing import StandardScaler
         from sklearn.neighbors import NearestNeighbors
