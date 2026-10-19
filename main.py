@@ -18,7 +18,7 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
-REFERENCE_WINDOW = 1250 # ~5 años para normalización estable
+REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
 
 class InstitutionalEngine:
     def __init__(self):
@@ -36,41 +36,25 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # --- NUEVA LÓGICA DE LIMPIEZA ROBUSTA ---
-                required_fred_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
-                available_fred_cols = [c for c in required_fred_cols if c in temp_df.columns]
+                # Normalizar índice para asegurar compatibilidad con Yahoo
+                temp_df.index = temp_df.index.normalize() 
                 
-                if len(available_fred_cols) == 5:
-                    # Paso A: Ordenar e identificar huecos
-                    temp_df = temp_df.sort_index()
-                    
-                    # Paso B: Forward Fill limitado (máximo 5 días de atraso permitido)
-                    # Esto rellena huecos cortos causados por diferencias de publicación en FRED
-                    temp_df[available_fred_cols] = temp_df[available_fred_cols].ffill(limit=5)
-                    
-                    # Paso C: Dropna solo si TODAS siguen vacías (huecos > 5 días)
-                    # Usamos 'all' aquí porque ffill ya resolvió los parciales
-                    clean_temp_df = temp_df.dropna(subset=available_fred_cols, how='all')
-                    
-                    # Paso D: Verificar frescura
-                    last_date = clean_temp_df.index[-1]
-                    days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
-                    
-                    if days_old <= 7: # Tolerancia ampliada a 7 días por festivos/lags
-                        f_df = clean_temp_df
-                        data_source = "FRED_REAL_CSV_ROBUST"
-                        print(f"✅ FRED REAL ROBUSTO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
-                    else:
-                        print(f"⚠️ CSV demasiado viejo ({days_old} días). Usando fallback.")
+                last_date = temp_df.index[-1]
+                days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
+                
+                if days_old <= 7: # Tolerancia ampliada por festivos/lags
+                    f_df = temp_df
+                    data_source = "FRED_REAL_CSV_RAW"
+                    print(f"✅ FRED RAW CARGADO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                 else:
-                     print(f"⚠️ Columnas incompletas en CSV. Usando fallback.")
+                    print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
             else:
                 print("⚠️ CSV no encontrado. Usando fallback.")
                 
         except Exception as e:
             print(f"❌ Error leyendo CSV: {str(e)[:60]}. Usando fallback.")
 
-        # 2. FALLBACK A PROXIES YAHOO SI NO HAY CSV VÁLIDO
+        # 2. FALLBACK A PROXIES SI NO HAY CSV VÁLIDO
         if f_df.empty:
             print("🔄 Activando proxies macro vía Yahoo Finance...")
             try:
@@ -90,10 +74,10 @@ class InstitutionalEngine:
                 available_proxy_cols = [c for c in cols_needed if c in yf_macro.columns]
                 
                 if available_proxy_cols:
-                    f_df = yf_macro[available_proxy_cols].dropna(how='any')
+                    f_df = yf_macro[available_proxy_cols]
                     f_df.index = f_df.index.normalize()
-                    data_source = "PROXIES_YAHOO_CLEANED"
-                    print(f"⚠️ Proxies Macro Limpios: {len(f_df)} registros cargados.")
+                    data_source = "PROXIES_YAHOO"
+                    print(f"⚠️ Proxies Macro: {len(f_df)} registros cargados.")
             except Exception as e:
                 print(f"❌ Proxies fallaron: {str(e)[:60]}")
 
@@ -116,9 +100,8 @@ class InstitutionalEngine:
         if f_df.empty or close.empty:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
-        # 4. MERGE INTERNO SEGURO
-        # Ahora usamos inner join, pero como f_df ya fue limpiado con ffill,
-        # tendremos muchas más fechas coincidentes sin perder integridad histórica.
+        # 4. MERGE INTERNO SEGURO (Inner Join)
+        # Solo conserva fechas donde AMBOS datasets tienen datos válidos
         df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
         
         # 5. FEATURE ENGINEERING
@@ -127,12 +110,20 @@ class InstitutionalEngine:
         if 'dgs10' in df.columns and 'dgs2' in df.columns and 'curve_slope' not in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. VALIDACIÓN FINAL
+        # 6. LIMPIEZA POST-MERGE CONTROLADA
+        # Rellenar huecos cortos (<5 días) causados por lags de publicación FRED
+        macro_cols = [c for c in ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr'] if c in df.columns]
+        if macro_cols:
+            df[macro_cols] = df[macro_cols].ffill(limit=5)
+            
+            # Eliminar filas que SIGUEN teniendo NaNs después del relleno limitado
+            df = df.dropna(subset=macro_cols, how='any')
+        
+        # Validación final de features completas
         final_features_check = [f for f in FEATURES if f in df.columns]
         if not final_features_check:
             raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
             
-        # Dropna final solo para asegurar que ratio_xlf_spy no dio NaNs raros
         df = df.dropna(subset=final_features_check)
         df.sort_index(inplace=True)
         df.index.name = 'date'
@@ -160,7 +151,7 @@ class InstitutionalEngine:
 
         changes = df_clean.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # Normalización por Ventana Rodante (Clave para igualar Colab)
+        # NORMALIZACIÓN POR VENTANA RODANTE (Clave para igualar Colab)
         hist_slice = changes.iloc[:-LOOKBACK]
         
         if len(hist_slice) > REFERENCE_WINDOW:
