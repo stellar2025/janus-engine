@@ -26,7 +26,7 @@ class InstitutionalEngine:
     def ingest(self):
         print("📡 Sincronizando fuentes...")
         
-        # 1. LEER CSV REAL DE FRED (SUBIDO POR GOOGLE APPS SCRIPT)
+        # 1. LEER CSV REAL DE FRED
         f_df = pd.DataFrame()
         csv_path = '/home/runner/work/janus-engine/janus-engine/data/fred_data_real.csv'
         data_source = "PROXIES_YAHOO" 
@@ -35,28 +35,32 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # --- LIMPIEZA QUIRÚRGICA IMITANDO EL COMPORTAMIENTO NATIVO DE LA API FRED EN COLAB ---
-                # En Colab, la API devuelve series limpias. Nuestro CSV tiene huecos visibles ('').
-                # Estrategia: Eliminar CUALQUIER fila donde falte AL MENOS UNA variable macro clave.
-                # Esto previene que pct_change() genere saltos artificiales por transiciones NaN->Valor.
+                # --- ESTRATEGIA CLAVE: INTERPOLACIÓN SUAVE ANTES DE FILTRAR ---
+                # En Colab, la API de FRED devuelve series continuas. 
+                # Aquí simulamos eso rellenando huecos cortos (<5 días) con interpolación lineal temporal.
+                # Esto evita perder miles de filas históricas válidas por un solo NaN puntual.
                 required_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
                 available_cols = [c for c in required_cols if c in temp_df.columns]
                 
                 if len(available_cols) == 5:
-                    # Dropna how='any': Solo conservamos días con 5/5 datos macro válidos
+                    # Paso A: Interpolar huecos temporales suaves (limit=5 días)
+                    temp_df[available_cols] = temp_df[available_cols].interpolate(method='time', limit=5)
+                    
+                    # Paso B: Dropna final solo para huecos irreparables (>5 días seguidos sin dato)
+                    # Esto preserva la integridad histórica mucho mejor que dropna(how='any') directo
                     clean_temp_df = temp_df.dropna(subset=available_cols, how='any')
                     
                     last_date = clean_temp_df.index[-1]
                     days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
                     
-                    if days_old <= 7: # Tolerancia para fines de semana/festivos largos
+                    if days_old <= 7: # Tolerancia amplia para festivos/lags
                         f_df = clean_temp_df
-                        data_source = "FRED_REAL_CSV_CLEANED"
-                        print(f"✅ FRED REAL LIMPIO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                        data_source = "FRED_REAL_CSV_SMOOTHED"
+                        print(f"✅ FRED REAL SUAVIZADO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                     else:
                         print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
                 else:
-                     print(f"⚠️ Columnas incompletas en CSV. Usando fallback.")
+                     print(f"⚠️ Columnas incompletas. Usando fallback.")
             else:
                 print("⚠️ CSV no encontrado. Usando fallback.")
                 
@@ -83,10 +87,11 @@ class InstitutionalEngine:
                 available_proxy_cols = [c for c in cols_needed if c in yf_macro.columns]
                 
                 if available_proxy_cols:
-                    f_df = yf_macro[available_proxy_cols].dropna(how='any')
+                    # Aplicar misma lógica de suavizado a los proxies
+                    f_df = yf_macro[available_proxy_cols].interpolate(method='time', limit=5).dropna(how='any')
                     f_df.index = f_df.index.normalize()
-                    data_source = "PROXIES_YAHOO_CLEANED"
-                    print(f"⚠️ Proxies Macro Limpios: {len(f_df)} registros cargados.")
+                    data_source = "PROXIES_YAHOO_SMOOTHED"
+                    print(f"⚠️ Proxies Macro Suavizados: {len(f_df)} registros cargados.")
             except Exception as e:
                 print(f"❌ Proxies fallaron: {str(e)[:60]}")
 
@@ -109,20 +114,22 @@ class InstitutionalEngine:
         if f_df.empty or close.empty:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
-        # 4. MERGE SEGURO (IDÉNTICO A COLAB)
-        # Usamos concat en eje 1. Como ya hemos filtrado los NaNs graves en f_df,
-        # esto alineará correctamente las fechas comunes.
-        df = pd.concat([f_df, close], axis=1)
+        # 4. MERGE INTERNO SEGURO
+        # Solo conserva fechas donde AMBOS datasets tienen datos válidos tras el suavizado
+        df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
         
-        # 5. FEATURE ENGINEERING (IDÉNTICO A COLAB)
+        # 5. FEATURE ENGINEERING
         if 'xlf' in df.columns and 'spy' in df.columns:
             df['ratio_xlf_spy'] = df['xlf'] / df['spy']
-        if 'dgs10' in df.columns and 'dgs2' in df.columns:
+        if 'dgs10' in df.columns and 'dgs2' in df.columns and 'curve_slope' not in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. LIMPIEZA FINAL (IDÉNTICO A COLAB)
-        # Rellenamos cualquier hueco residual menor con forward-fill
-        df = df.ffill() 
+        # 6. VALIDACIÓN FINAL
+        final_features_check = [f for f in FEATURES if f in df.columns]
+        if not final_features_check:
+            raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
+            
+        df = df.dropna(subset=final_features_check)
         df.sort_index(inplace=True)
         df.index.name = 'date'
         
