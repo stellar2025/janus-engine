@@ -1,7 +1,7 @@
 name: Janus Engine Daily Scan
 on:
   schedule:
-    - cron: '0 9 * * 1-5'
+    - cron: '45 7 * * 1-5'
   workflow_dispatch:
 
 jobs:
