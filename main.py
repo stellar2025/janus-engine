@@ -18,7 +18,7 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
-REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
+REFERENCE_WINDOW = 1250 # ~5 años para normalización estable
 
 class InstitutionalEngine:
     def __init__(self):
@@ -36,25 +36,34 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # Limpiar inmediatamente filas con huecos críticos en macros
+                # --- NUEVA LÓGICA DE LIMPIEZA ROBUSTA ---
                 required_fred_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
                 available_fred_cols = [c for c in required_fred_cols if c in temp_df.columns]
                 
                 if len(available_fred_cols) == 5:
-                    # Dropna how='any': Solo conservar días donde TODAS las macros tienen valor
-                    clean_temp_df = temp_df.dropna(subset=available_fred_cols, how='any')
+                    # Paso A: Ordenar e identificar huecos
+                    temp_df = temp_df.sort_index()
                     
+                    # Paso B: Forward Fill limitado (máximo 5 días de atraso permitido)
+                    # Esto rellena huecos cortos causados por diferencias de publicación en FRED
+                    temp_df[available_fred_cols] = temp_df[available_fred_cols].ffill(limit=5)
+                    
+                    # Paso C: Dropna solo si TODAS siguen vacías (huecos > 5 días)
+                    # Usamos 'all' aquí porque ffill ya resolvió los parciales
+                    clean_temp_df = temp_df.dropna(subset=available_fred_cols, how='all')
+                    
+                    # Paso D: Verificar frescura
                     last_date = clean_temp_df.index[-1]
                     days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
                     
-                    if days_old <= 5:
+                    if days_old <= 7: # Tolerancia ampliada a 7 días por festivos/lags
                         f_df = clean_temp_df
-                        data_source = "FRED_REAL_CSV_CLEANED"
-                        print(f"✅ FRED REAL LIMPIO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                        data_source = "FRED_REAL_CSV_ROBUST"
+                        print(f"✅ FRED REAL ROBUSTO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                     else:
-                        print(f"⚠️ CSV desactualizado ({days_old} días). Usando fallback.")
+                        print(f"⚠️ CSV demasiado viejo ({days_old} días). Usando fallback.")
                 else:
-                     print(f"⚠️ CSV no tiene todas las columnas requeridas. Usando fallback.")
+                     print(f"⚠️ Columnas incompletas en CSV. Usando fallback.")
             else:
                 print("⚠️ CSV no encontrado. Usando fallback.")
                 
@@ -108,6 +117,8 @@ class InstitutionalEngine:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
         # 4. MERGE INTERNO SEGURO
+        # Ahora usamos inner join, pero como f_df ya fue limpiado con ffill,
+        # tendremos muchas más fechas coincidentes sin perder integridad histórica.
         df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
         
         # 5. FEATURE ENGINEERING
@@ -121,6 +132,7 @@ class InstitutionalEngine:
         if not final_features_check:
             raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
             
+        # Dropna final solo para asegurar que ratio_xlf_spy no dio NaNs raros
         df = df.dropna(subset=final_features_check)
         df.sort_index(inplace=True)
         df.index.name = 'date'
@@ -140,20 +152,16 @@ class InstitutionalEngine:
         if n_features == 0:
             raise ValueError("Sin datos con varianza para analizar.")
             
-        # CRÍTICO: Eliminar filas incompletas ANTES de calcular cambios porcentuales
-        # Esto previene artefactos en pct_change() causados por huecos o transiciones
+        # Limpieza previa segura
         df_clean = df[available_features].dropna()
         
         if len(df_clean) < LOOKBACK * 2:
             raise ValueError("Datos insuficientes tras limpieza para análisis robusto.")
 
-        # Calcular cambios porcentuales sobre datos limpios
         changes = df_clean.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # NORMALIZACIÓN POR VENTANA RODANTE (FIX PARA DISCREPANCIA COLAB/GITHUB)
-        # Usamos solo los últimos REFERENCE_WINDOW días como base estadística
-        # Esto elimina el sesgo de décadas antiguas (ej: alta volatilidad de los 80s vs baja de los 90s)
-        hist_slice = changes.iloc[:-LOOKBACK] # Excluir la ventana actual del cálculo histórico
+        # Normalización por Ventana Rodante (Clave para igualar Colab)
+        hist_slice = changes.iloc[:-LOOKBACK]
         
         if len(hist_slice) > REFERENCE_WINDOW:
             ref_changes = hist_slice.tail(REFERENCE_WINDOW)
@@ -162,14 +170,12 @@ class InstitutionalEngine:
             
         mean_h = ref_changes.mean()
         std_h = ref_changes.std()
-        std_h[std_h==0] = 1 # Evitar división por cero
+        std_h[std_h==0] = 1
         
-        # Vector actual basado en la misma referencia estadística
         curr_win = changes.iloc[-LOOKBACK:]
         curr_vec = ((curr_win - mean_h) / std_h).values.flatten()
         
         h_states, h_dates = [], []
-        # Iterar sobre la misma referencia histórica usada para mean/std
         for i in range(len(ref_changes) - LOOKBACK):
             w = ref_changes.iloc[i:i+LOOKBACK]
             h_states.append(((w - mean_h) / std_h).values.flatten())
