@@ -18,6 +18,7 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
+REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
 
 class InstitutionalEngine:
     def __init__(self):
@@ -150,19 +151,26 @@ class InstitutionalEngine:
             
         changes = df[available_features].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # NORMALIZACIÓN GLOBAL (IDÉNTICO A COLAB)
-        mean_h = changes.mean()
-        std_h = changes.std()
+        # NORMALIZACIÓN POR VENTANA RODANTE (Clave para igualar Colab)
+        hist_slice = changes.iloc[:-LOOKBACK]
+        
+        if len(hist_slice) > REFERENCE_WINDOW:
+            ref_changes = hist_slice.tail(REFERENCE_WINDOW)
+        else:
+            ref_changes = hist_slice
+            
+        mean_h = ref_changes.mean()
+        std_h = ref_changes.std()
         std_h[std_h==0]=1
         
         curr_win = changes.iloc[-LOOKBACK:]
         curr_vec = ((curr_win - mean_h) / std_h).values.flatten()
         
         h_states, h_dates = [], []
-        for i in range(len(changes) - LOOKBACK):
-            w = changes.iloc[i:i+LOOKBACK]
+        for i in range(len(ref_changes) - LOOKBACK):
+            w = ref_changes.iloc[i:i+LOOKBACK]
             h_states.append(((w - mean_h) / std_h).values.flatten())
-            h_dates.append(changes.index[i+LOOKBACK-1])
+            h_dates.append(ref_changes.index[i+LOOKBACK-1])
             
         from sklearn.preprocessing import StandardScaler
         from sklearn.neighbors import NearestNeighbors
