@@ -8,7 +8,7 @@ import requests
 import warnings
 warnings.filterwarnings('ignore')
 
-# CONFIGURACIÓN SEGURA PARA GITHUB ACTIONS
+# CONFIGURACIÓN SEGURA PARA GITHUB ACTIONS Y COLAB
 FRED_API_KEY = os.environ.get('FRED_API_KEY', '37016f0e7a9489663c246fe275a8f8b4')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8045615537:AAHljJ57Y_-kn-j7A3SLHfbaRqj61y3Tntg')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '1816896290')
@@ -41,7 +41,7 @@ class InstitutionalEngine:
                 f_df = pd.concat(frames, axis=1)
                 print(f"✅ FRED: {len(f_df)} registros cargados.")
         except Exception as e:
-            print(f"⚠️ FRED Error: {str(e)[:60]}")
+            print(f"️ FRED Error: {str(e)[:60]}")
 
         # 2. Yahoo Data
         close = pd.DataFrame()
@@ -79,7 +79,7 @@ class InstitutionalEngine:
         conn.execute("PRAGMA journal_mode=WAL;")
         df.to_sql('market_synced_data', conn, if_exists='replace', index=True)
         conn.close()
-        print(f" BD guardada: {len(df)} filas.")
+        print(f"💾 BD guardada: {len(df)} filas.")
         return df
 
     def analyze_live(self, df):
@@ -126,37 +126,38 @@ class InstitutionalEngine:
         twins = [{'date': h_dates[idx[0][k]], 'dist': normalized_dist} for k in range(5)]
         return twins, normalized_dist, dynamic_threshold, n_features
 
-    def send_alert(self, dist, threshold, n_feat):
+    def send_alert(self, dist, threshold, n_feat, execution_time, data_date):
         has_full_data = (n_feat == len(FEATURES))
         
         if has_full_data:
             status = "🟢 NORMAL" if dist > threshold else "🔴 ALERTA SISTÉMICA"
-            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
+            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
         else:
             status = "🔍 OBSERVACIÓN" if dist > threshold else "⚠️ SEGUIMIENTO"
-            msg = f"🤖 *Janus Engine*\n📅 {pd.Timestamp.now().strftime('%Y-%m-%d')}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
+            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n⏳ FRED pendiente"
             
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
-            requests.get(url)
-            print("✅ Telegram enviado.")
-        except Exception as e:
-            print(f"⚠️ Telegram Error: {str(e)[:50]}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
+        response = requests.get(url, timeout=10)
+        
+        # FORZAR ERROR VISIBLE SI TELEGRAM RECHAZA EL MENSAJE
+        if response.status_code != 200:
+            raise Exception(f"TELEGRAM FALLÓ: Código {response.status_code} - {response.text}")
+        
+        print("✅ Telegram enviado correctamente.")
 
     def run(self):
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        try: 
-            df = pd.read_sql_query("SELECT * FROM market_synced_data", conn, index_col='date', parse_dates=['date'])
-            if df.empty: raise Exception("DB vacía")
-        except: 
-            print("⚠️ BD no encontrada o vacía. Generando datos frescos...")
-            df = self.ingest()
-        conn.close()
+        # FORZAR ACTUALIZACIÓN DIARIA DE DATOS FRESCOS
+        print("🔄 Actualizando datos frescos antes del análisis...")
+        df = self.ingest()
         
         twins, dist, dyn_thresh, n_feat = self.analyze_live(df)
-        self.send_alert(dist, dyn_thresh, n_feat)
-        print(f"🏁 Janus Engine completado. Distancia normalizada: {dist:.2f} | Variables activas: {n_feat}")
+        
+        # Timestamps reales para el mensaje
+        exec_time = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M UTC')
+        data_date = df.index[-1].strftime('%Y-%m-%d')
+        
+        self.send_alert(dist, dyn_thresh, n_feat, exec_time, data_date)
+        print(f" Janus Engine completado. Distancia normalizada: {dist:.2f} | Variables activas: {n_feat}")
 
 if __name__ == "__main__":
     engine = InstitutionalEngine()
