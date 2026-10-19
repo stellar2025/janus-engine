@@ -18,7 +18,8 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
-REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
+REFERENCE_WINDOW = 1250 # ~5 años para normalización estable
+START_DATE_CUTOFF = '2000-01-01' # CRÍTICO: Ignorar era pre-VIX para alinear con Colab
 
 class InstitutionalEngine:
     def __init__(self):
@@ -36,18 +37,34 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # Normalizar índice para asegurar compatibilidad con Yahoo
-                temp_df.index = temp_df.index.normalize() 
+                # --- ALINEACIÓN PERFECTA CON COLAB ---
+                # Paso 1: Recortar histórico antiguo (pre-2000) donde VIX/HY son NaN
+                temp_df = temp_df.loc[temp_df.index >= START_DATE_CUTOFF]
                 
-                last_date = temp_df.index[-1]
-                days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
+                # Paso 2: Interpolación Lineal Suave para huecos cortos
+                # Esto evita los saltos bruscos de ffill() que distorsionan pct_change()
+                required_fred_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
+                available_fred_cols = [c for c in required_fred_cols if c in temp_df.columns]
                 
-                if days_old <= 7: # Tolerancia ampliada por festivos/lags
-                    f_df = temp_df
-                    data_source = "FRED_REAL_CSV_RAW"
-                    print(f"✅ FRED RAW CARGADO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                if len(available_fred_cols) == 5:
+                    # interpolate method='time' rellena huecos basándose en el tiempo transcurrido
+                    # limit=5 permite rellenar hasta 5 días festivos/retrasados sin inventar datos
+                    temp_df[available_fred_cols] = temp_df[available_fred_cols].interpolate(method='time', limit=5)
+                    
+                    # Dropna final solo si quedaron huecos irreparables (>5 días)
+                    clean_temp_df = temp_df.dropna(subset=available_fred_cols, how='any')
+                    
+                    last_date = clean_temp_df.index[-1]
+                    days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
+                    
+                    if days_old <= 7:
+                        f_df = clean_temp_df
+                        data_source = "FRED_REAL_CSV_INTERPOLATED"
+                        print(f"✅ FRED REAL INTERPOLADO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                    else:
+                        print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
                 else:
-                    print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
+                     print(f"⚠️ Columnas incompletas. Usando fallback.")
             else:
                 print("⚠️ CSV no encontrado. Usando fallback.")
                 
@@ -74,17 +91,18 @@ class InstitutionalEngine:
                 available_proxy_cols = [c for c in cols_needed if c in yf_macro.columns]
                 
                 if available_proxy_cols:
-                    f_df = yf_macro[available_proxy_cols]
+                    f_df = yf_macro[available_proxy_cols].dropna(how='any')
                     f_df.index = f_df.index.normalize()
-                    data_source = "PROXIES_YAHOO"
-                    print(f"⚠️ Proxies Macro: {len(f_df)} registros cargados.")
+                    data_source = "PROXIES_YAHOO_CLEANED"
+                    print(f"⚠️ Proxies Macro Limpios: {len(f_df)} registros cargados.")
             except Exception as e:
                 print(f"❌ Proxies fallaron: {str(e)[:60]}")
 
         # 3. YAHOO DATA (PRECIOS)
         close = pd.DataFrame()
         try:
-            yf_data = yf.download(['XLF', 'KBE', 'SPY'], start="2000-01-01", progress=False)
+            # IMPORTANTE: Descargar precios SOLO desde la misma fecha de corte que FRED
+            yf_data = yf.download(['XLF', 'KBE', 'SPY'], start=START_DATE_CUTOFF, progress=False)
             if isinstance(yf_data.columns, pd.MultiIndex):
                 try: close = yf_data.xs('Adj Close', level='Price', axis=1)
                 except: close = yf_data.xs('Close', level='Price', axis=1)
@@ -100,8 +118,7 @@ class InstitutionalEngine:
         if f_df.empty or close.empty:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
-        # 4. MERGE INTERNO SEGURO (Inner Join)
-        # Solo conserva fechas donde AMBOS datasets tienen datos válidos
+        # 4. MERGE INTERNO SEGURO
         df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
         
         # 5. FEATURE ENGINEERING
@@ -110,16 +127,7 @@ class InstitutionalEngine:
         if 'dgs10' in df.columns and 'dgs2' in df.columns and 'curve_slope' not in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. LIMPIEZA POST-MERGE CONTROLADA
-        # Rellenar huecos cortos (<5 días) causados por lags de publicación FRED
-        macro_cols = [c for c in ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr'] if c in df.columns]
-        if macro_cols:
-            df[macro_cols] = df[macro_cols].ffill(limit=5)
-            
-            # Eliminar filas que SIGUEN teniendo NaNs después del relleno limitado
-            df = df.dropna(subset=macro_cols, how='any')
-        
-        # Validación final de features completas
+        # 6. VALIDACIÓN FINAL
         final_features_check = [f for f in FEATURES if f in df.columns]
         if not final_features_check:
             raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
