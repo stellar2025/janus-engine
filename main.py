@@ -18,7 +18,6 @@ DB_NAME = '/tmp/market_intelligence.db'
 FEATURES = ['vix', 'hy_spread', 'ratio_xlf_spy', 'curve_slope', 'sofr']
 BASE_THRESHOLD = 6.5 
 LOOKBACK = 20
-REFERENCE_WINDOW = 1250 # ~5 años de datos recientes para normalización estable
 
 class InstitutionalEngine:
     def __init__(self):
@@ -36,28 +35,26 @@ class InstitutionalEngine:
             if os.path.exists(csv_path):
                 temp_df = pd.read_csv(csv_path, index_col='DATE', parse_dates=['DATE'])
                 
-                # --- ESTRATEGIA CLAVE: INTERPOLACIÓN SUAVE ANTES DE FILTRAR ---
-                # En Colab, la API de FRED devuelve series continuas. 
-                # Aquí simulamos eso rellenando huecos cortos (<5 días) con interpolación lineal temporal.
-                # Esto evita perder miles de filas históricas válidas por un solo NaN puntual.
+                # --- LIMPIEZA QUIRÚRGICA IMITANDO FRED API ---
+                # La API de FRED en Colab no devuelve filas donde TODAS las macros son NaN simultáneamente
+                # salvo festivos extremos. Nuestro CSV tiene basura parcial.
+                # Estrategia: Eliminar filas donde falte CUALQUIERA de las 5 macros clave.
+                # Esto garantiza que cada fila tenga datos completos, igual que en Colab.
                 required_cols = ['vix', 'hy_spread', 'dgs2', 'dgs10', 'sofr']
                 available_cols = [c for c in required_cols if c in temp_df.columns]
                 
                 if len(available_cols) == 5:
-                    # Paso A: Interpolar huecos temporales suaves (limit=5 días)
-                    temp_df[available_cols] = temp_df[available_cols].interpolate(method='time', limit=5)
-                    
-                    # Paso B: Dropna final solo para huecos irreparables (>5 días seguidos sin dato)
-                    # Esto preserva la integridad histórica mucho mejor que dropna(how='any') directo
+                    # Dropna how='any': Borra cualquier fila incompleta.
+                    # En Colab, FRED suele devolver series alineadas. Aquí forzamos esa alineación.
                     clean_temp_df = temp_df.dropna(subset=available_cols, how='any')
                     
                     last_date = clean_temp_df.index[-1]
                     days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
                     
-                    if days_old <= 7: # Tolerancia amplia para festivos/lags
+                    if days_old <= 7: # Tolerancia para fines de semana/festivos
                         f_df = clean_temp_df
-                        data_source = "FRED_REAL_CSV_SMOOTHED"
-                        print(f"✅ FRED REAL SUAVIZADO: {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
+                        data_source = "FRED_REAL_CSV_STRICT"
+                        print(f"✅ FRED REAL (STRICT): {len(f_df)} registros | Último: {last_date.strftime('%Y-%m-%d')}")
                     else:
                         print(f"⚠️ CSV viejo ({days_old} días). Usando fallback.")
                 else:
@@ -88,11 +85,10 @@ class InstitutionalEngine:
                 available_proxy_cols = [c for c in cols_needed if c in yf_macro.columns]
                 
                 if available_proxy_cols:
-                    # Aplicar misma lógica de suavizado a los proxies
-                    f_df = yf_macro[available_proxy_cols].interpolate(method='time', limit=5).dropna(how='any')
+                    f_df = yf_macro[available_proxy_cols].dropna(how='any')
                     f_df.index = f_df.index.normalize()
-                    data_source = "PROXIES_YAHOO_SMOOTHED"
-                    print(f"⚠️ Proxies Macro Suavizados: {len(f_df)} registros cargados.")
+                    data_source = "PROXIES_YAHOO_CLEANED"
+                    print(f"⚠️ Proxies Macro Limpios: {len(f_df)} registros cargados.")
             except Exception as e:
                 print(f"❌ Proxies fallaron: {str(e)[:60]}")
 
@@ -116,21 +112,20 @@ class InstitutionalEngine:
             raise ValueError("Sin datos de alguna fuente crítica.")
 
         # 4. MERGE INTERNO SEGURO
-        # Solo conserva fechas donde AMBOS datasets tienen datos válidos tras el suavizado
-        df = pd.merge(f_df, close, left_index=True, right_index=True, how='inner')
+        # Igual que en Colab: concat + ffill. 
+        # Pero aquí ya hemos filtrado los NaNs graves en f_df.
+        df = pd.concat([f_df, close], axis=1)
         
-        # 5. FEATURE ENGINEERING
+        # 5. FEATURE ENGINEERING (IDÉNTICO A COLAB)
         if 'xlf' in df.columns and 'spy' in df.columns:
             df['ratio_xlf_spy'] = df['xlf'] / df['spy']
-        if 'dgs10' in df.columns and 'dgs2' in df.columns and 'curve_slope' not in df.columns:
+        if 'dgs10' in df.columns and 'dgs2' in df.columns:
              df['curve_slope'] = df['dgs10'] - df['dgs2']
 
-        # 6. VALIDACIÓN FINAL
-        final_features_check = [f for f in FEATURES if f in df.columns]
-        if not final_features_check:
-            raise ValueError("No se pudieron calcular las features requeridas tras el merge.")
-            
-        df = df.dropna(subset=final_features_check)
+        # 6. LIMPIEZA FINAL IDÉNTICA A COLAB
+        # En Colab haces: df = df.ffill(). Sort_index. Nada más.
+        # Replicamos eso exactamente.
+        df = df.ffill() 
         df.sort_index(inplace=True)
         df.index.name = 'date'
         
@@ -142,6 +137,7 @@ class InstitutionalEngine:
         return df
 
     def analyze_live(self, df):
+        # --- LÓGICA IDÉNTICA A COLAB SIN MODIFICACIONES ---
         available_features = [f for f in FEATURES 
                              if f in df.columns and df[f].std() > 0]
         
@@ -151,26 +147,19 @@ class InstitutionalEngine:
             
         changes = df[available_features].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         
-        # NORMALIZACIÓN POR VENTANA RODANTE (Clave para igualar Colab)
-        hist_slice = changes.iloc[:-LOOKBACK]
-        
-        if len(hist_slice) > REFERENCE_WINDOW:
-            ref_changes = hist_slice.tail(REFERENCE_WINDOW)
-        else:
-            ref_changes = hist_slice
-            
-        mean_h = ref_changes.mean()
-        std_h = ref_changes.std()
+        # Media y Desviación sobre TODA la historia (como en Colab)
+        mean_h = changes.mean()
+        std_h = changes.std()
         std_h[std_h==0]=1
         
         curr_win = changes.iloc[-LOOKBACK:]
         curr_vec = ((curr_win - mean_h) / std_h).values.flatten()
         
         h_states, h_dates = [], []
-        for i in range(len(ref_changes) - LOOKBACK):
-            w = ref_changes.iloc[i:i+LOOKBACK]
+        for i in range(len(changes) - LOOKBACK):
+            w = changes.iloc[i:i+LOOKBACK]
             h_states.append(((w - mean_h) / std_h).values.flatten())
-            h_dates.append(ref_changes.index[i+LOOKBACK-1])
+            h_dates.append(changes.index[i+LOOKBACK-1])
             
         from sklearn.preprocessing import StandardScaler
         from sklearn.neighbors import NearestNeighbors
