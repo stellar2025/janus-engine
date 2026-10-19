@@ -24,7 +24,7 @@ class InstitutionalEngine:
         pass
 
     def ingest(self):
-        print(" Sincronizando fuentes...")
+        print("📡 Sincronizando fuentes...")
         
         # PRIORIDAD 1: LEER CSV REAL SUBIDO DESDE GOOGLE APPS SCRIPT
         f_df = pd.DataFrame()
@@ -70,7 +70,7 @@ class InstitutionalEngine:
                 print(f"⚠️ Proxies Macro (Yahoo): {len(f_df)} registros cargados.")
                 
             except Exception as e:
-                print(f" Proxies Macro fallaron: {str(e)[:60]}")
+                print(f"❌ Proxies Macro fallaron: {str(e)[:60]}")
 
         # 2. Yahoo Data (Precios)
         close = pd.DataFrame()
@@ -85,7 +85,7 @@ class InstitutionalEngine:
             close.columns = [c.lower() for c in close.columns]
             print(f"✅ Yahoo Precios: {len(close)} registros cargados.")
         except Exception as e:
-            print(f"⚠️ Yahoo Error: {str(e)[:60]}")
+            print(f"️ Yahoo Error: {str(e)[:60]}")
 
         if f_df.empty and close.empty:
             raise ValueError("Sin datos de ninguna fuente.")
@@ -123,7 +123,7 @@ class InstitutionalEngine:
         conn.execute("PRAGMA journal_mode=WAL;")
         df.to_sql('market_synced_data', conn, if_exists='replace', index=True)
         conn.close()
-        print(f" BD guardada: {len(df)} filas. Fuente: {data_source}")
+        print(f"💾 BD guardada: {len(df)} filas. Fuente: {data_source}")
         return df
 
     def analyze_live(self, df):
@@ -168,11 +168,11 @@ class InstitutionalEngine:
         has_full_data = (n_feat == len(FEATURES))
         
         if has_full_data:
-            status = " NORMAL" if dist > threshold else " ALERTA SISTÉMICA"
-            msg = f"🤖 *Janus Engine*\n️ Ejecutado: {execution_time}\n Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n Macro: ✅ ({n_feat}/5 vars)"
+            status = "🟢 NORMAL" if dist > threshold else "🔴 ALERTA SISTÉMICA"
+            msg = f" *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (umbral: {threshold:.2f})\n{status}\n📊 Macro: ✅ ({n_feat}/5 vars)"
         else:
             status = "🔍 OBSERVACIÓN" if dist > threshold else "⚠️ SEGUIMIENTO"
-            msg = f" *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n FRED pendiente"
+            msg = f"🤖 *Janus Engine*\n⏱️ Ejecutado: {execution_time}\n📅 Datos hasta: {data_date}\n Dist: {dist:.2f} (ajustado: {threshold:.2f})\n{status}\n📊 Parcial: {n_feat}/5 vars\n FRED pendiente"
             
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={msg}&parse_mode=Markdown"
         response = requests.get(url, timeout=10)
